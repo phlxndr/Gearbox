@@ -20,18 +20,24 @@ async function main() {
   // Get command line arguments
   const args = process.argv.slice(2);
   
-  if (args.length < 4) {
-    console.log('Usage: node index.js <rpcUrl> <poolAddress> <fromDate> <toDate> <interestFee>');
+  if (args.length < 5) {
+    console.log('Usage: node index.js <rpcUrl> <poolAddress> <fromDate> <toDate> <interestFee> [--revenue-share] [--addresses] [--rev-coeff]');
     console.log('');
     console.log('Parameters:');
-    console.log('  rpcUrl       - Ethereum RPC endpoint URL');
-    console.log('  poolAddress  - Gearbox pool contract address (0x...)');
-    console.log('  fromDate     - Start date in YYYY-MM-DD format');
-    console.log('  toDate       - End date in YYYY-MM-DD format');
-    console.log('  interestFee  - Interest fee in basis points (0-10000)');
+    console.log('  rpcUrl           - Ethereum RPC endpoint URL');
+    console.log('  poolAddress      - Gearbox pool contract address (0x...)');
+    console.log('  fromDate         - Start date in YYYY-MM-DD format');
+    console.log('  toDate           - End date in YYYY-MM-DD format');
+    console.log('  interestFee      - Interest fee in basis points (0-10000)');
+    console.log('');
+    console.log('Optional (for revenue share):');
+    console.log('  --revenue-share  - Enable revenue share mode');
+    console.log('  --addresses      - Comma-separated list of addresses (0xABC,0xDEF,...)');
+    console.log('  --rev-coeff      - Revenue share coefficient (0-1)');
     console.log('');
     console.log('Examples:');
-    console.log('  node index.js https://lb.drpc.live/ethereum/... 0x123... 2025-09-01 2025-09-30 1000');
+    console.log('  node index.js https://... 0x123... 2025-09-01 2025-09-30 1000');
+    console.log('  node index.js https://... 0x123... 2025-09-01 2025-09-30 1000 --revenue-share --addresses 0xABC,0xDEF --rev-coeff 0.2');
     console.log('');
     console.log('Note: Replace 0x123... with actual Gearbox pool address');
     process.exit(1);
@@ -41,6 +47,29 @@ async function main() {
   
   // Parse parameters
   const parsedInterestFee = parseInt(interestFee, 10);
+  
+  // Parse optional revenue share parameters
+  let revenueShareAddresses = null;
+  let revenueShareCoeff = null;
+  
+  const revenueShareIndex = args.indexOf('--revenue-share');
+  if (revenueShareIndex !== -1) {
+    const addressesIndex = args.indexOf('--addresses');
+    const revCoeffIndex = args.indexOf('--rev-coeff');
+    
+    if (addressesIndex !== -1 && args[addressesIndex + 1]) {
+      revenueShareAddresses = args[addressesIndex + 1].split(',').map(addr => addr.trim().toLowerCase());
+    }
+    
+    if (revCoeffIndex !== -1 && args[revCoeffIndex + 1]) {
+      revenueShareCoeff = parseFloat(args[revCoeffIndex + 1]);
+    }
+    
+    if (!revenueShareAddresses || revenueShareAddresses.length === 0 || revenueShareCoeff === null) {
+      console.error('❌ Revenue share mode requires --addresses and --rev-coeff');
+      process.exit(1);
+    }
+  }
   
   // Validate inputs
   const validation = validateInputParameters(poolAddress, fromDate, toDate, parsedInterestFee);
@@ -68,7 +97,9 @@ async function main() {
       poolAddress, 
       fromDate, 
       toDate, 
-      parsedInterestFee
+      parsedInterestFee,
+      revenueShareAddresses,
+      revenueShareCoeff
     );
     const endTime = Date.now();
     
@@ -88,6 +119,17 @@ async function main() {
     console.log(`   Underlying Token: ${result.underlyingToken} (${result.underlyingTokenName})`);
     console.log(`   Token Decimals: ${result.tokenDecimals}`);
     console.log('');
+    
+    // Revenue share results
+    if (result.revenueShare !== undefined) {
+      console.log('💰 REVENUE SHARE RESULTS');
+      console.log('========================');
+      console.log(`Addresses Weighted TVL: ${result.addressesWeightedTVL} ${result.underlyingTokenName}`);
+      console.log(`Revenue Share: ${result.revenueShare} ${result.underlyingTokenName}`);
+      console.log(`Revenue Share Coefficient: ${result.revenueShareCoeff}`);
+      console.log(`Number of Addresses: ${result.revenueShareAddresses.length}`);
+      console.log('');
+    }
     
     // Raw values for debugging
     console.log('🔍 Raw Values (for debugging):');
