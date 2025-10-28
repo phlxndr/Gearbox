@@ -62,5 +62,26 @@ export const ERC20_ABI = [
     "outputs": [{"name": "", "type": "uint8"}],
     "stateMutability": "view",
     "type": "function"
+  },
+  {
+    "inputs": [{"name": "account", "type": "address"}],
+    "name": "balanceOf",
+    "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  }
+];
+
+// ERC20 Transfer Event ABI
+export const ERC20_TRANSFER_EVENT_ABI = [
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "name": "from", "type": "address"},
+      {"indexed": true, "name": "to", "type": "address"},
+      {"indexed": false, "name": "value", "type": "uint256"}
+    ],
+    "name": "Transfer",
+    "type": "event"
   }
 ];
