@@ -10,7 +10,7 @@ import { createPublicClient, http } from 'viem';
 import { mainnet } from 'viem/chains';
 import { validateInputParameters, sanitizeInputParameters, formatErrorMessage } from './utils/validation.js';
 import { dateToStartBlock, dateToEndBlock, getBlockTimestamp } from './utils/block-utils.js';
-import { getPoolEvents, getPoolStateAtBlock, getPoolParameters, getUnderlyingToken } from './utils/pool-utils.js';
+import { getPoolEvents, getPoolStateAtBlock, getPoolParameters, getUnderlyingToken, getTransferEvents, getLPBalancesAtBlock } from './utils/pool-utils.js';
 import { getTokenName, getTokenDecimals } from './utils/token-utils.js';
 import { getCaches } from './utils/cache-utils.js';
 
@@ -21,9 +21,11 @@ import { getCaches } from './utils/cache-utils.js';
  * @param {string} fromDate - Start date in YYYY-MM-DD format
  * @param {string} toDate - End date in YYYY-MM-DD format
  * @param {number} interestFee - Interest fee in basis points (0-10000)
+ * @param {Array<string>} revenueShareAddresses - Optional array of addresses for revenue sharing
+ * @param {number} revenueShareCoeff - Optional revenue share coefficient (0-1)
  * @returns {Promise<Object>} Calculation results
  */
-export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toDate, interestFee) {
+export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toDate, interestFee, revenueShareAddresses = null, revenueShareCoeff = null) {
   try {
     // ========================================================================
     // INITIALIZATION
@@ -251,6 +253,105 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     }
     
     // ========================================================================
+    // REVENUE SHARE CALCULATION (if enabled)
+    // ========================================================================
+    
+    let addressesWeightedTVL = 0n;
+    
+    if (revenueShareAddresses && revenueShareAddresses.length > 0 && revenueShareCoeff !== null) {
+      console.log('💰 Calculating revenue share for selected addresses...');
+      console.log(`   Selected addresses: ${revenueShareAddresses.length}`);
+      console.log(`   Revenue share coefficient: ${revenueShareCoeff}`);
+      
+      // The pool address IS the LP token address
+      const lpTokenAddress = sanitized.poolAddress;
+      
+      // Search for events in expanded range for interpolation
+      const searchFromBlock = Math.max(0, fromBlock - Math.floor(searchRange / 12));
+      const searchToBlock = toBlock + Math.floor(searchRange / 12);
+      
+      console.log(`🔍 Fetching LP token Transfer events from block ${searchFromBlock} to ${searchToBlock}...`);
+      const transferEvents = await getTransferEvents(lpTokenAddress, searchFromBlock, searchToBlock, client);
+      
+      // Get unique block numbers where transfers occurred in the period
+      const transferBlocks = [...new Set(transferEvents
+        .filter(e => {
+          const eventBlock = Number(e.blockNumber);
+          return eventBlock >= fromBlock && eventBlock <= toBlock;
+        })
+        .map(e => Number(e.blockNumber))
+      )].sort((a, b) => a - b);
+      
+      // Filter transfers that involve our selected addresses
+      const relevantBlocks = transferBlocks.filter(blockNum => {
+        const blockTransfers = transferEvents.filter(e => Number(e.blockNumber) === blockNum);
+        return blockTransfers.some(transfer => {
+          const from = transfer.args?.from?.toLowerCase();
+          const to = transfer.args?.to?.toLowerCase();
+          return revenueShareAddresses.some(addr => 
+            addr.toLowerCase() === from || addr.toLowerCase() === to
+          );
+        });
+      });
+      
+      console.log(`   Found ${relevantBlocks.length} blocks with transfers involving selected addresses`);
+      
+      // Add start and end blocks
+      const allBalanceCheckBlocks = [fromBlock, ...relevantBlocks, toBlock].filter((block, idx, arr) => arr.indexOf(block) === idx).sort((a, b) => a - b);
+      
+      console.log(`   Checking balances at ${allBalanceCheckBlocks.length} key blocks...`);
+      
+      // Get balances at each key block
+      const balanceCheckPromises = allBalanceCheckBlocks.map(blockNumber => 
+        getBlockTimestamp(blockNumber, client, blockCache, CACHE_TTL).then(timestamp => ({
+          blockNumber,
+          timestamp
+        }))
+      );
+      
+      const balanceCheckTimes = await Promise.all(balanceCheckPromises);
+      
+      // Process in batches to avoid RPC overload
+      const BATCH_SIZE = 20;
+      let addressesTotalBalance = 0n;
+      
+      for (let i = 0; i < balanceCheckTimes.length - 1; i += BATCH_SIZE) {
+        const batch = balanceCheckTimes.slice(i, Math.min(i + BATCH_SIZE, balanceCheckTimes.length));
+        
+        const batchPromises = batch.map(async ({ blockNumber, timestamp }) => {
+          const balances = await getLPBalancesAtBlock(lpTokenAddress, revenueShareAddresses, blockNumber, client);
+          
+          // Sum all balances
+          let totalBalance = 0n;
+          for (const balance of balances.values()) {
+            totalBalance += balance;
+          }
+          
+          return { blockNumber, timestamp, totalBalance };
+        });
+        
+        const batchResults = await Promise.all(batchPromises);
+        
+        // Calculate weighted sum for this batch
+        for (let j = 0; j < batchResults.length - 1; j++) {
+          const current = batchResults[j];
+          const next = batchResults[j + 1];
+          
+          const timeDelta = next.timestamp - current.timestamp;
+          if (timeDelta > 0) {
+            addressesTotalBalance += current.totalBalance * BigInt(timeDelta);
+          }
+        }
+        
+        console.log(`   Processed ${Math.min(i + BATCH_SIZE, balanceCheckTimes.length)}/${balanceCheckTimes.length} balance checks`);
+      }
+      
+      addressesWeightedTVL = totalTimeSum > 0 ? addressesTotalBalance / BigInt(totalTimeSum) : 0n;
+      
+      console.log(`✅ Addresses weighted TVL calculated: ${addressesWeightedTVL.toString()}`);
+    }
+    
+    // ========================================================================
     // FEE APPLICATION AND FINALIZATION
     // ========================================================================
     
@@ -269,6 +370,19 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     console.log('🔢 Getting token decimals...');
     const tokenDecimals = await getTokenDecimals(underlyingToken, client);
     
+    // Calculate revenue share if enabled
+    let revenueShare = null;
+    if (revenueShareAddresses && revenueShareAddresses.length > 0 && revenueShareCoeff !== null) {
+      // Formula: (addresses_TW_TVL / pool_TW_TVL) * pool_revenue * rev_share_coeff
+      // Use totalRevenue (before fees), not finalRevenueForDAO
+      if (avgTVL > 0n && addressesWeightedTVL > 0n && totalRevenue > 0n) {
+        const addressesShareRatio = (addressesWeightedTVL * 1000000n) / avgTVL; // Scale by 1e6
+        const poolRevenueScaled = totalRevenue * BigInt(Math.floor(revenueShareCoeff * 10000));
+        revenueShare = (addressesShareRatio * poolRevenueScaled) / 10000000000n; // Scale back
+      }
+      console.log(`✅ Revenue share calculated: ${revenueShare ? revenueShare.toString() : '0'}`);
+    }
+    
     // Finish calculation
     console.log('🎉 Calculation completed successfully!');
     
@@ -276,7 +390,7 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     // RESULT PREPARATION
     // ========================================================================
     
-    return {
+    const result = {
       pool: sanitized.poolAddress,
       fromDate: sanitized.fromDate,
       toDate: sanitized.toDate,
@@ -292,6 +406,16 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
       underlyingTokenName: await getTokenName(underlyingToken, client),
       tokenDecimals: tokenDecimals
     };
+    
+    // Add revenue share info if calculated
+    if (revenueShare !== null) {
+      result.addressesWeightedTVL = (Number(addressesWeightedTVL) / Math.pow(10, tokenDecimals)).toFixed(6);
+      result.revenueShare = (Number(revenueShare) / Math.pow(10, tokenDecimals)).toFixed(6);
+      result.revenueShareAddresses = revenueShareAddresses;
+      result.revenueShareCoeff = revenueShareCoeff;
+    }
+    
+    return result;
     
   } catch (error) {
     console.error('Error in calculateGearboxRevenue:', error);
