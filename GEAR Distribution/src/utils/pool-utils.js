@@ -6,7 +6,7 @@
 // IMPORTS
 // ============================================================================
 
-import { POOL_ABI } from '../config.js';
+import { POOL_ABI, ERC20_TRANSFER_EVENT_ABI, ERC20_ABI } from '../config.js';
 
 // ============================================================================
 // EVENT FETCHING
@@ -186,4 +186,112 @@ export async function getUnderlyingToken(poolAddress, client) {
     abi: POOL_ABI,
     functionName: 'underlyingToken'
   });
+}
+
+// ============================================================================
+// LP TOKEN BALANCE MANAGEMENT
+// ============================================================================
+
+/**
+ * Get Transfer events for LP token in a block range
+ * @param {string} tokenAddress - LP token contract address
+ * @param {number} fromBlock - Starting block number
+ * @param {number} toBlock - Ending block number
+ * @param {Object} client - Viem client
+ * @returns {Promise<Array>} Array of Transfer events sorted by block number
+ */
+export async function getTransferEvents(tokenAddress, fromBlock, toBlock, client) {
+  const MAX_BLOCK_RANGE = 100000; // RPC limit for paid tier
+  const totalBlocks = toBlock - fromBlock;
+  const totalBatches = Math.ceil(totalBlocks / MAX_BLOCK_RANGE);
+  
+  console.log(`🔄 Fetching LP token Transfer events in ${totalBatches} batches...`);
+  
+  const allEvents = [];
+  
+  for (let i = 0; i < totalBatches; i++) {
+    const batchFromBlock = fromBlock + (i * MAX_BLOCK_RANGE);
+    const batchToBlock = Math.min(batchFromBlock + MAX_BLOCK_RANGE - 1, toBlock);
+    
+    try {
+      const transferLogs = await client.getLogs({
+        address: tokenAddress,
+        event: {
+          type: 'event',
+          name: 'Transfer',
+          inputs: [
+            { indexed: true, name: 'from', type: 'address' },
+            { indexed: true, name: 'to', type: 'address' },
+            { indexed: false, name: 'value', type: 'uint256' }
+          ]
+        },
+        fromBlock: BigInt(batchFromBlock),
+        toBlock: BigInt(batchToBlock)
+      });
+      
+      allEvents.push(...transferLogs);
+      console.log(`   Batch ${i + 1}/${totalBatches} completed. Found ${allEvents.length} total events so far.`);
+    } catch (error) {
+      console.error(`Error fetching batch ${i + 1}:`, error.message);
+      throw error;
+    }
+  }
+  
+  const sortedEvents = allEvents.sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
+  console.log(`✅ Found ${sortedEvents.length} total Transfer events across ${totalBatches} batches`);
+  return sortedEvents;
+}
+
+/**
+ * Get LP token balance for an address at a specific block
+ * @param {string} tokenAddress - LP token contract address
+ * @param {string} address - Address to get balance for
+ * @param {number} blockNumber - Block number
+ * @param {Object} client - Viem client
+ * @returns {Promise<bigint>} Balance at the block
+ */
+export async function getLPBalanceAtBlock(tokenAddress, address, blockNumber, client) {
+  try {
+    const balance = await client.readContract({
+      address: tokenAddress,
+      abi: ERC20_ABI,
+      functionName: 'balanceOf',
+      args: [address],
+      blockNumber: BigInt(blockNumber)
+    });
+    return BigInt(balance);
+  } catch (error) {
+    console.warn(`Could not get balance for ${address} at block ${blockNumber}, returning 0`);
+    return 0n;
+  }
+}
+
+/**
+ * Get LP token balances for multiple addresses at a specific block
+ * @param {string} tokenAddress - LP token contract address
+ * @param {Array<string>} addresses - Array of addresses to get balances for
+ * @param {number} blockNumber - Block number
+ * @param {Object} client - Viem client
+ * @returns {Promise<Map<string, bigint>>} Map of address -> balance
+ */
+export async function getLPBalancesAtBlock(tokenAddress, addresses, blockNumber, client) {
+  const balances = new Map();
+  
+  // Fetch balances in parallel with batching to avoid overwhelming the RPC
+  const BATCH_SIZE = 50;
+  
+  for (let i = 0; i < addresses.length; i += BATCH_SIZE) {
+    const batch = addresses.slice(i, i + BATCH_SIZE);
+    const batchPromises = batch.map(address => 
+      getLPBalanceAtBlock(tokenAddress, address, blockNumber, client)
+        .then(balance => ({ address, balance }))
+    );
+    
+    const batchResults = await Promise.all(batchPromises);
+    for (const { address, balance } of batchResults) {
+      balances.set(address, balance);
+    }
+  }
+  
+  return balances;
 }
