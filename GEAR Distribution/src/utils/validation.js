@@ -79,7 +79,7 @@ export function isValidPercentage(percentage) {
  * @param {number} interestFee - Interest fee in basis points
  * @returns {Object} Validation result with isValid and errors
  */
-export function validateInputParameters(poolAddress, fromDate, toDate, interestFee) {
+export function validateInputParameters(poolAddress, fromDate, toDate, interestFee, deployDate = null) {
   const errors = [];
   
   // Validate pool address
@@ -101,6 +101,19 @@ export function validateInputParameters(poolAddress, fromDate, toDate, interestF
     errors.push('fromDate must be before or equal to toDate');
   }
   
+  // Validate optional deploy date
+  if (deployDate) {
+    if (!isValidDateFormat(deployDate)) {
+      errors.push('Invalid deployDate format. Expected YYYY-MM-DD');
+    } else {
+      const deploy = new Date(deployDate);
+      const from = new Date(fromDate);
+      if (deploy > from) {
+        errors.push('deployDate must be before or equal to fromDate');
+      }
+    }
+  }
+
   // Validate interest fee
   if (!isValidPercentage(interestFee)) {
     errors.push('interestFee must be a number between 0 and 10000 (basis points)');
@@ -120,12 +133,13 @@ export function validateInputParameters(poolAddress, fromDate, toDate, interestF
  * @param {number} interestFee - Interest fee in basis points
  * @returns {Object} Sanitized parameters
  */
-export function sanitizeInputParameters(poolAddress, fromDate, toDate, interestFee) {
+export function sanitizeInputParameters(poolAddress, fromDate, toDate, interestFee, deployDate = null) {
   return {
     poolAddress: poolAddress?.toLowerCase(),
     fromDate: fromDate?.trim(),
     toDate: toDate?.trim(),
-    interestFee: Number(interestFee)
+    interestFee: Number(interestFee),
+    deployDate: deployDate ? deployDate.trim() : null
   };
 }
 
@@ -157,4 +171,3 @@ export function formatErrorMessage(error) {
   
   return error.message || 'Unknown error occurred';
 }
-

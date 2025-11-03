@@ -30,6 +30,12 @@ async function main() {
     console.log('  toDate           - End date in YYYY-MM-DD format');
     console.log('  interestFee      - Interest fee in basis points (0-10000)');
     console.log('');
+    console.log('Optional (general):');
+    console.log('  --deploy-date    - Deployment date in YYYY-MM-DD; limits event backfill');
+    console.log('  --treasury       - Override treasury address (0x...)');
+    console.log('  --dao-share-bps  - Override DAO fee share in basis points (0-10000)');
+    console.log('  --debug-share-price - Log share price deltas for each event interval');
+    console.log('');
     console.log('Optional (for revenue share):');
     console.log('  --revenue-share  - Enable revenue share mode');
     console.log('  --addresses      - Comma-separated list of addresses (0xABC,0xDEF,...)');
@@ -51,6 +57,10 @@ async function main() {
   // Parse optional revenue share parameters
   let revenueShareAddresses = null;
   let revenueShareCoeff = null;
+  let deployDate = null;
+  let debugSharePrice = false;
+  let explicitTreasury = null;
+  let daoShareOverride = null;
   
   const revenueShareIndex = args.indexOf('--revenue-share');
   if (revenueShareIndex !== -1) {
@@ -71,8 +81,30 @@ async function main() {
     }
   }
   
+  const deployDateIndex = args.indexOf('--deploy-date');
+  if (deployDateIndex !== -1 && args[deployDateIndex + 1]) {
+    deployDate = args[deployDateIndex + 1];
+  }
+  
+  if (args.includes('--debug-share-price')) {
+    debugSharePrice = true;
+  }
+  const treasuryIndex = args.indexOf('--treasury');
+  if (treasuryIndex !== -1 && args[treasuryIndex + 1]) {
+    explicitTreasury = args[treasuryIndex + 1].toLowerCase();
+  }
+  const daoShareIndex = args.indexOf('--dao-share-bps');
+  if (daoShareIndex !== -1 && args[daoShareIndex + 1]) {
+    const parsedDaoShare = parseInt(args[daoShareIndex + 1], 10);
+    if (Number.isNaN(parsedDaoShare) || parsedDaoShare < 0 || parsedDaoShare > 10000) {
+      console.error('❌ --dao-share-bps must be an integer between 0 and 10000.');
+      process.exit(1);
+    }
+    daoShareOverride = parsedDaoShare;
+  }
+  
   // Validate inputs
-  const validation = validateInputParameters(poolAddress, fromDate, toDate, parsedInterestFee);
+  const validation = validateInputParameters(poolAddress, fromDate, toDate, parsedInterestFee, deployDate);
   
   if (!validation.isValid) {
     console.error('❌ Input validation failed:');
@@ -85,6 +117,15 @@ async function main() {
   console.log(`   Pool Address: ${poolAddress}`);
   console.log(`   Date Range: ${fromDate} to ${toDate}`);
   console.log(`   Interest Fee: ${parsedInterestFee} basis points (${parsedInterestFee / 100}%)`);
+  if (deployDate) {
+    console.log(`   Deploy Date: ${deployDate}`);
+  }
+  if (debugSharePrice) {
+    console.log('   Debug Share Price: enabled');
+  }
+  if (daoShareOverride !== null) {
+    console.log(`   DAO Share Override: ${daoShareOverride} bps`);
+  }
   console.log('');
   
   try {
@@ -99,7 +140,9 @@ async function main() {
       toDate, 
       parsedInterestFee,
       revenueShareAddresses,
-      revenueShareCoeff
+      revenueShareCoeff,
+      deployDate,
+      { debugSharePrice, treasuryAddressOverride: explicitTreasury, daoShareOverride }
     );
     const endTime = Date.now();
     
@@ -134,7 +177,29 @@ async function main() {
     // Raw values for debugging
     console.log('🔍 Raw Values (for debugging):');
     console.log(`   Total Revenue Raw: ${result.totalRevenueRaw}`);
+    if (result.unrealizedRevenue !== undefined) {
+      console.log(`   Unrealized Revenue (DAO): ${result.unrealizedRevenue}`);
+    }
+    if (result.realizedRevenue !== undefined) {
+      console.log(`   Realized Revenue (DAO): ${result.realizedRevenue}`);
+    }
+    if (result.totalRevenue !== undefined) {
+      console.log(`   Total Revenue (DAO): ${result.totalRevenue}`);
+    }
     console.log(`   Average TVL Raw: ${result.avgTVLRaw}`);
+    if (typeof result.coverageRatio === 'number') {
+      console.log(`   Data Coverage: ${(result.coverageRatio * 100).toFixed(2)}% of requested period`);
+      console.log(`   Time Using Fallback Data: ${result.fallbackCoverageSeconds ?? 0} seconds`);
+      console.log(`   Fallback Intervals: ${result.fallbackIntervals ?? 0}`);
+      console.log(`   Negative Share Price Intervals: ${result.negativeSharePriceIntervals}`);
+      if (result.actualFromBlock !== undefined && result.actualToBlock !== undefined) {
+        console.log(`   Anchored Blocks: ${result.actualFromBlock} -> ${result.actualToBlock}`);
+      }
+      if (result.deployBlock !== undefined) {
+        console.log(`   Deploy Date Used: ${result.deployDate}`);
+        console.log(`   Deploy Block Used: ${result.deployBlock}`);
+      }
+    }
     
   } catch (error) {
     console.error('❌ Calculation failed:');

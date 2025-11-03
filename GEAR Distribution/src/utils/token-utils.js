@@ -7,6 +7,9 @@
 // ============================================================================
 
 import { ERC20_ABI } from '../config.js';
+import { withRetry } from './rpc-utils.js';
+
+const RETRY_OPTIONS = { maxRetries: 3, initialDelayMs: 200, backoffMultiplier: 2 };
 
 // ============================================================================
 // TOKEN NAME UTILITIES
@@ -38,20 +41,20 @@ const ERC20_NAME_ABI = [
  */
 export async function getTokenName(tokenAddress, client) {
   try {
-    const name = await client.readContract({
+    const name = await withRetry(() => client.readContract({
       address: tokenAddress,
       abi: ERC20_NAME_ABI,
       functionName: 'name'
-    });
+    }), RETRY_OPTIONS);
     return name;
   } catch (error) {
     // Fallback to symbol if name fails
     try {
-      const symbol = await client.readContract({
+      const symbol = await withRetry(() => client.readContract({
         address: tokenAddress,
         abi: ERC20_NAME_ABI,
         functionName: 'symbol'
-      });
+      }), RETRY_OPTIONS);
       return symbol;
     } catch (error2) {
       // Final fallback to address
@@ -71,9 +74,9 @@ export async function getTokenName(tokenAddress, client) {
  * @returns {Promise<number>} Token decimals
  */
 export async function getTokenDecimals(tokenAddress, client) {
-  return await client.readContract({
+  return await withRetry(() => client.readContract({
     address: tokenAddress,
     abi: ERC20_ABI,
     functionName: 'decimals'
-  });
+  }), RETRY_OPTIONS);
 }

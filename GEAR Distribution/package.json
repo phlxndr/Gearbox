@@ -1,0 +1,8 @@
+{
+  "name": "gear-distribution",
+  "version": "0.0.0",
+  "type": "module",
+  "dependencies": {
+    "viem": "^2.38.6"
+  }
+}

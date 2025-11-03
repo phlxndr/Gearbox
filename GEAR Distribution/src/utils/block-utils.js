@@ -3,6 +3,12 @@
  */
 
 // ============================================================================
+// IMPORTS
+// ============================================================================
+
+import { withRetry } from './rpc-utils.js';
+
+// ============================================================================
 // DATE TO BLOCK CONVERSION
 // ============================================================================
 
@@ -19,14 +25,14 @@ export async function dateToStartBlock(dateString, client) {
   const targetTimestamp = Math.floor(date.getTime() / 1000);
   
   // Get latest block to establish upper bound
-  const latestBlock = await client.getBlockNumber();
+  const latestBlock = await withRetry(() => client.getBlockNumber());
   let low = 0;
   let high = Number(latestBlock);
   
   // Binary search for the block with timestamp closest to target
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
-    const block = await client.getBlock({ blockNumber: BigInt(mid) });
+    const block = await withRetry(() => client.getBlock({ blockNumber: BigInt(mid) }));
     const blockTimestamp = Number(block.timestamp);
     
     if (blockTimestamp === targetTimestamp) {
@@ -54,14 +60,14 @@ export async function dateToEndBlock(dateString, client) {
   const targetTimestamp = Math.floor(date.getTime() / 1000);
   
   // Get latest block to establish upper bound
-  const latestBlock = await client.getBlockNumber();
+  const latestBlock = await withRetry(() => client.getBlockNumber());
   let low = 0;
   let high = Number(latestBlock);
   
   // Binary search for the block with timestamp closest to target
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
-    const block = await client.getBlock({ blockNumber: BigInt(mid) });
+    const block = await withRetry(() => client.getBlock({ blockNumber: BigInt(mid) }));
     const blockTimestamp = Number(block.timestamp);
     
     if (blockTimestamp === targetTimestamp) {
@@ -101,7 +107,7 @@ export async function getBlockTimestamp(blockNumber, client, blockCache, CACHE_T
   }
   
   // Fetch from blockchain
-  const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
+  const block = await withRetry(() => client.getBlock({ blockNumber: BigInt(blockNumber) }));
   const timestamp = Number(block.timestamp);
   
   // Cache the result

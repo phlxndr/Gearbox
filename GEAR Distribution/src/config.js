@@ -7,7 +7,8 @@ export const POOL_ABI = [
     "anonymous": false,
     "inputs": [
       {"indexed": true, "name": "sender", "type": "address"},
-      {"indexed": false, "name": "amount", "type": "uint256"},
+      {"indexed": true, "name": "owner", "type": "address"},
+      {"indexed": false, "name": "assets", "type": "uint256"},
       {"indexed": false, "name": "shares", "type": "uint256"}
     ],
     "name": "Deposit",
@@ -17,7 +18,9 @@ export const POOL_ABI = [
     "anonymous": false,
     "inputs": [
       {"indexed": true, "name": "sender", "type": "address"},
-      {"indexed": false, "name": "amount", "type": "uint256"},
+      {"indexed": true, "name": "receiver", "type": "address"},
+      {"indexed": true, "name": "owner", "type": "address"},
+      {"indexed": false, "name": "assets", "type": "uint256"},
       {"indexed": false, "name": "shares", "type": "uint256"}
     ],
     "name": "Withdraw",
@@ -49,6 +52,13 @@ export const POOL_ABI = [
     "inputs": [],
     "name": "daoSplit",
     "outputs": [{"name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "treasury",
+    "outputs": [{"name": "", "type": "address"}],
     "stateMutability": "view",
     "type": "function"
   }

@@ -10,7 +10,7 @@ import { createPublicClient, http } from 'viem';
 import { mainnet } from 'viem/chains';
 import { validateInputParameters, sanitizeInputParameters, formatErrorMessage } from './utils/validation.js';
 import { dateToStartBlock, dateToEndBlock, getBlockTimestamp } from './utils/block-utils.js';
-import { getPoolEvents, getPoolStateAtBlock, getPoolParameters, getUnderlyingToken, getTransferEvents, getLPBalancesAtBlock } from './utils/pool-utils.js';
+import { getPoolEvents, derivePoolSnapshotsFromEvents, getPoolParameters, getUnderlyingToken, getAddressBalancesAtBlocksFromEvents, getTreasuryAddress, SHARE_PRICE_SCALE } from './utils/pool-utils.js';
 import { getTokenName, getTokenDecimals } from './utils/token-utils.js';
 import { getCaches } from './utils/cache-utils.js';
 
@@ -25,8 +25,19 @@ import { getCaches } from './utils/cache-utils.js';
  * @param {number} revenueShareCoeff - Optional revenue share coefficient (0-1)
  * @returns {Promise<Object>} Calculation results
  */
-export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toDate, interestFee, revenueShareAddresses = null, revenueShareCoeff = null) {
+export async function calculateGearboxRevenue(
+  rpcUrl,
+  poolAddress,
+  fromDate,
+  toDate,
+  interestFee,
+  revenueShareAddresses = null,
+  revenueShareCoeff = null,
+  deployDate = null,
+  options = {}
+) {
   try {
+    const { debugSharePrice = false, treasuryAddressOverride = null, daoShareOverride = null } = options ?? {};
     // ========================================================================
     // INITIALIZATION
     // ========================================================================
@@ -38,19 +49,20 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     });
     
     // Get cache instances
-    const { blockCache, poolStateCache, CACHE_TTL } = getCaches();
+    const { blockCache, CACHE_TTL } = getCaches();
     
     // ========================================================================
     // INPUT VALIDATION
     // ========================================================================
     
     // Validate and sanitize input parameters
-    const sanitized = sanitizeInputParameters(poolAddress, fromDate, toDate, interestFee);
+    const sanitized = sanitizeInputParameters(poolAddress, fromDate, toDate, interestFee, deployDate);
     const validation = validateInputParameters(
       sanitized.poolAddress, 
       sanitized.fromDate, 
       sanitized.toDate, 
-      sanitized.interestFee
+      sanitized.interestFee,
+      sanitized.deployDate
     );
     
     if (!validation.isValid) {
@@ -73,183 +85,253 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     console.log(`   To: ${sanitized.toDate} 23:59 UTC (block ${toBlock})`);
     
     // ========================================================================
-    // EVENT FETCHING
+    // EVENT FETCHING & STATE RECONSTRUCTION
     // ========================================================================
     
-    // Step 2: Get pool events in the range
-    console.log('🔍 Fetching pool events...');
-    const events = await getPoolEvents(sanitized.poolAddress, fromBlock, toBlock, client);
-    console.log(`✅ Found ${events.length} events in the range`);
+    const APPROX_BLOCKS_PER_DAY = 7200;
+    const DEFAULT_LOOKBACK_DAYS = 365;
+    const MAX_LOOKBACK_DAYS = DEFAULT_LOOKBACK_DAYS * 5;
+    const effectiveDeployDate = sanitized.deployDate || null;
+    let deployBlock;
+    let automaticLookbackDays = null;
     
-    // ========================================================================
-    // POOL STATE INITIALIZATION
-    // ========================================================================
+    if (effectiveDeployDate) {
+      deployBlock = await dateToStartBlock(effectiveDeployDate, client);
+      if (deployBlock > fromBlock) {
+        console.warn('Provided deployDate falls after the requested fromDate. Using fromDate as deploy point.');
+        deployBlock = fromBlock;
+      }
+    } else {
+      // No explicit deploy date: start with a 1-year lookback window so we can pick up
+      // the first deposit before the requested range and iterate if that wasn't enough.
+      automaticLookbackDays = DEFAULT_LOOKBACK_DAYS;
+      const lookbackBlocks = automaticLookbackDays * APPROX_BLOCKS_PER_DAY;
+      deployBlock = Math.max(0, fromBlock - lookbackBlocks);
+      console.log(`ℹ️ No deployDate provided; backfilling approximately ${automaticLookbackDays} days of events (~${lookbackBlocks} blocks).`);
+    }
     
-    // Step 3: Get initial and final pool states
-    console.log('📊 Getting pool states...');
-    const initialState = await getPoolStateAtBlock(sanitized.poolAddress, fromBlock, client, poolStateCache, CACHE_TTL);
+    let allEvents = [];
+    let transferEventsAll = [];
+    let snapshots = [];
+    while (true) {
+      // Pull deposit/withdraw logs for the current lookback window.
+      console.log(`🔍 Fetching pool events from block ${deployBlock} to ${toBlock}...`);
+      const { events: fetchedEvents, transferEvents = [] } = await getPoolEvents(
+        sanitized.poolAddress,
+        deployBlock,
+        toBlock,
+        client,
+        { includeTransfers: true }
+      );
+      allEvents = fetchedEvents;
+      transferEventsAll = transferEvents;
+      
+      console.log('📊 Deriving pool state timeline from events...');
+      const derived = derivePoolSnapshotsFromEvents(allEvents);
+      snapshots = derived.snapshots;
+      
+      const stateBeforePeriod = [...snapshots].reverse().find(snapshot => snapshot.blockNumber < fromBlock);
+      // We only trust the reconstruction if we saw non-zero supply before fromBlock.
+      const hasSupplyBeforePeriod = stateBeforePeriod ? stateBeforePeriod.totalSupply > 0n : false;
+      
+      if (effectiveDeployDate) {
+        if (!hasSupplyBeforePeriod) {
+          console.warn('⚠️ No deposits found before the requested range using provided deployDate. TVL will remain zero if the pool was funded earlier.');
+        }
+        break;
+      }
+      
+      if (hasSupplyBeforePeriod || deployBlock === 0) {
+        if (!hasSupplyBeforePeriod) {
+          console.warn('⚠️ No deposits detected before the requested range even after reaching genesis. TVL may be zero.');
+        }
+        break;
+      }
+      
+      if (automaticLookbackDays >= MAX_LOOKBACK_DAYS) {
+        console.warn(`⚠️ No deposits detected before the requested range within ~${automaticLookbackDays} days of history. Provide --deploy-date to scan further back.`);
+        break;
+      }
+      
+      // Double the time window (bounded) to continue hunting for the initial deposit.
+      const newLookbackDays = Math.min(MAX_LOOKBACK_DAYS, automaticLookbackDays * 2);
+      const newDeployBlock = Math.max(0, fromBlock - newLookbackDays * APPROX_BLOCKS_PER_DAY);
+      
+      if (newDeployBlock === deployBlock) {
+        console.warn('⚠️ Unable to extend lookback further. TVL may remain zero if earlier deposits exist.');
+        break;
+      }
+      
+      automaticLookbackDays = newLookbackDays;
+      deployBlock = newDeployBlock;
+      console.log(`ℹ️ Expanding automatic lookback to approximately ${automaticLookbackDays} days (block ${deployBlock}).`);
+    }
+    
+    const deployBlockNote = effectiveDeployDate
+      ? ` derived from ${effectiveDeployDate}`
+      : automaticLookbackDays
+        ? ` (~${automaticLookbackDays} days back)`
+        : '';
+    console.log(`🛠️ Using deploy block ${deployBlock}${deployBlockNote}`);
+    
+    const eventsInRange = allEvents.filter(event => {
+      const blockNumber = Number(event.blockNumber);
+      return blockNumber >= fromBlock && blockNumber <= toBlock;
+    });
+    console.log(`✅ Retrieved ${allEvents.length} events since deploy; ${eventsInRange.length} fall inside the target window.`);
+    
     const initialTimestamp = await getBlockTimestamp(fromBlock, client, blockCache, CACHE_TTL);
-    const finalState = await getPoolStateAtBlock(sanitized.poolAddress, toBlock, client, poolStateCache, CACHE_TTL);
     const finalTimestamp = await getBlockTimestamp(toBlock, client, blockCache, CACHE_TTL);
+    let actualFromBlock = fromBlock;
+    let actualToBlock = toBlock;
+    let actualFromTimestamp = initialTimestamp;
+    let actualToTimestamp = finalTimestamp;
+    let anchorSnapshots = [];
+    let anchorTimestamps = [];
     
+    if (snapshots.length === 0) {
+      throw new Error('No deposit/withdraw events found to build pool state.');
+    }
+
+    const findNearestSnapshotIndex = (targetBlock) => {
+      let bestIndex = 0;
+      let bestDiff = Math.abs(Number(snapshots[0].blockNumber) - targetBlock);
+      for (let i = 1; i < snapshots.length; i++) {
+        const diff = Math.abs(Number(snapshots[i].blockNumber) - targetBlock);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIndex = i;
+        }
+      }
+      return bestIndex;
+    };
+
+    let startIdx = findNearestSnapshotIndex(fromBlock);
+    let endIdx = findNearestSnapshotIndex(toBlock);
+    if (startIdx > endIdx) {
+      const tmp = startIdx;
+      startIdx = endIdx;
+      endIdx = tmp;
+    }
+
+    anchorSnapshots = snapshots.slice(startIdx, endIdx + 1);
+    if (anchorSnapshots.length < 2) {
+      throw new Error('Not enough events to compute revenue within the requested period.');
+    }
+
+    anchorTimestamps = await Promise.all(anchorSnapshots.map(snapshot =>
+      getBlockTimestamp(snapshot.blockNumber, client, blockCache, CACHE_TTL)
+    ));
+
+    actualFromBlock = anchorSnapshots[0].blockNumber;
+    actualToBlock = anchorSnapshots[anchorSnapshots.length - 1].blockNumber;
+    actualFromTimestamp = anchorTimestamps[0];
+    actualToTimestamp = anchorTimestamps[anchorTimestamps.length - 1];
+
+    if (actualFromBlock !== fromBlock) {
+      console.warn(`⚠️ Unable to anchor precisely at start block ${fromBlock}. Using nearest event block ${actualFromBlock}.`);
+    }
+    if (actualToBlock !== toBlock) {
+      console.warn(`⚠️ Unable to anchor precisely at end block ${toBlock}. Using nearest event block ${actualToBlock}.`);
+    }
+
+    console.log(`   Effective coverage anchored between blocks ${actualFromBlock} and ${actualToBlock}.`);
+
+    console.log('✅ Pool state interpolation setup complete');
+
     // ========================================================================
     // POOL CONFIGURATION
     // ========================================================================
     
-    // Step 4: Get pool parameters
     console.log('⚙️ Fetching pool parameters...');
-    const finalDaoSplit = await getPoolParameters(sanitized.poolAddress, client);
+    let finalDaoSplit = await getPoolParameters(sanitized.poolAddress, client);
+    if (daoShareOverride !== null) {
+      console.log(`   Overriding DAO share from ${finalDaoSplit} bps to ${daoShareOverride} bps`);
+      finalDaoSplit = daoShareOverride;
+    }
     
-    // Step 5: Get underlying token address
     console.log('🪙 Getting underlying token...');
     const underlyingToken = await getUnderlyingToken(sanitized.poolAddress, client);
+
+    let treasuryAddress = treasuryAddressOverride ? treasuryAddressOverride.toLowerCase() : null;
+    if (!treasuryAddress) {
+      console.log('🏦 Fetching treasury address (latest)...');
+      treasuryAddress = (await getTreasuryAddress(sanitized.poolAddress, client))?.toLowerCase();
+    }
     
     // ========================================================================
-    // POOL STATE INTERPOLATION SETUP
+    // INTERVAL PROCESSING & METRICS
     // ========================================================================
     
-    // Step 6: Process events and calculate intervals
-    console.log('🔄 Processing events and calculating intervals...');
+    console.log('🔄 Processing intervals and calculating aggregates...');
     let totalRevenue = 0n;
     let weightedTVLSum = 0n;
     let totalTimeSum = 0;
-    const intervals = [];
+    const fallbackIntervals = 0;
+    const fallbackTimeSum = 0;
     
-    console.log('📊 Setting up pool state interpolation...');
+    let negativeSharePriceIntervals = 0;
+    let negativeSharePriceDiff = 0n;
     
-    // Always search for events before and after the range to get proper pool states
-    const searchRange = 7 * 24 * 60 * 60; // 7 days in seconds
-    const searchFromBlock = Math.max(0, fromBlock - Math.floor(searchRange / 12)); // ~7 days before
-    const searchToBlock = toBlock + Math.floor(searchRange / 12); // ~7 days after
-    
-    console.log(`🔍 Searching for events from block ${searchFromBlock} to ${searchToBlock}...`);
-    
-    const [beforeEvents, afterEvents] = await Promise.all([
-      getPoolEvents(sanitized.poolAddress, searchFromBlock, fromBlock - 1, client),
-      getPoolEvents(sanitized.poolAddress, toBlock + 1, searchToBlock, client)
-    ]);
-    
-    console.log(`   Found ${beforeEvents.length} events before period, ${afterEvents.length} events after period`);
-    console.log(`   Found ${events.length} events within period`);
-    
-    // Get pool states at key points
-    let startState = initialState;
-    let endState = finalState;
-    
-    // For start point: use state after last event before the period
-    if (beforeEvents.length > 0) {
-      const lastBeforeEvent = beforeEvents[beforeEvents.length - 1];
-      const beforeBlockNumber = Number(lastBeforeEvent.blockNumber);
-      startState = await getPoolStateAtBlock(sanitized.poolAddress, beforeBlockNumber, client, poolStateCache, CACHE_TTL);
-      console.log(`   Using pool state from block ${beforeBlockNumber} (last event before period)`);
-    } else {
-      console.log(`   Using initial pool state from block ${fromBlock}`);
-    }
-    
-    // For end point: use state after last event up to the end of period
-    const allEventsInPeriod = [...beforeEvents, ...events, ...afterEvents].filter(event => {
-      const eventBlock = Number(event.blockNumber);
-      return eventBlock <= toBlock;
-    });
-    
-    if (allEventsInPeriod.length > 0) {
-      const lastEventInPeriod = allEventsInPeriod[allEventsInPeriod.length - 1];
-      const lastEventBlock = Number(lastEventInPeriod.blockNumber);
-      endState = await getPoolStateAtBlock(sanitized.poolAddress, lastEventBlock, client, poolStateCache, CACHE_TTL);
-      console.log(`   Using pool state from block ${lastEventBlock} (last event up to end of period)`);
-    } else {
-      console.log(`   Using final pool state from block ${toBlock}`);
-    }
-    
-    // ========================================================================
-    // INTERVAL PROCESSING
-    // ========================================================================
-    
-    // Add start point
-    intervals.push({ blockNumber: fromBlock, timestamp: initialTimestamp, ...startState });
-    
-    // Add events within the period
-    if (events.length > 0) {
-      console.log(`🔄 Processing ${events.length} event blocks within period...`);
-      
-      const BATCH_SIZE = 100;
-      const PARALLEL_BATCHES = 3;
-      
-      for (let i = 0; i < events.length; i += BATCH_SIZE * PARALLEL_BATCHES) {
-        const parallelBatchPromises = [];
-        
-        for (let j = 0; j < PARALLEL_BATCHES && i + j * BATCH_SIZE < events.length; j++) {
-          const batchStart = i + j * BATCH_SIZE;
-          const batchEnd = Math.min(batchStart + BATCH_SIZE, events.length);
-          const batch = events.slice(batchStart, batchEnd);
-          
-          const batchPromise = (async () => {
-            const batchPromises = batch.map(async (event) => {
-              const blockNumber = Number(event.blockNumber);
-              const [timestamp, state] = await Promise.all([
-                getBlockTimestamp(blockNumber, client, blockCache, CACHE_TTL),
-                getPoolStateAtBlock(sanitized.poolAddress, blockNumber, client, poolStateCache, CACHE_TTL)
-              ]);
-              return { blockNumber, timestamp, ...state };
-            });
-            return await Promise.all(batchPromises);
-          })();
-          parallelBatchPromises.push(batchPromise);
-        }
-        
-        const parallelResults = await Promise.all(parallelBatchPromises);
-        for (const batchResults of parallelResults) {
-          intervals.push(...batchResults);
-        }
-        
-        const processed = Math.min(i + BATCH_SIZE * PARALLEL_BATCHES, events.length);
-        const percentage = ((processed / events.length) * 100).toFixed(1);
-        console.log(`   Processed ${processed}/${events.length} events (${percentage}%)`);
-        
-        if (processed < events.length) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-      }
-    }
-    
-    // Add end point
-    intervals.push({ blockNumber: toBlock, timestamp: finalTimestamp, ...endState });
-    
-    console.log('✅ Pool state interpolation setup complete');
-    
-    // ========================================================================
-    // REVENUE AND TVL CALCULATION
-    // ========================================================================
-    
-    // Step 7: Calculate revenue and TVL
-    console.log('💰 Calculating revenue and TVL...');
-    
-    for (let i = 0; i < intervals.length - 1; i++) {
-      const current = intervals[i];
-      const next = intervals[i + 1];
-      
-      const timeDelta = next.timestamp - current.timestamp;
+    const SCALE = SHARE_PRICE_SCALE;
+    for (let i = 0; i < anchorSnapshots.length - 1; i++) {
+      const current = anchorSnapshots[i];
+      const next = anchorSnapshots[i + 1];
+      const currentTimestamp = anchorTimestamps[i];
+      const nextTimestamp = anchorTimestamps[i + 1];
+      const timeDelta = nextTimestamp - currentTimestamp;
       if (timeDelta <= 0) continue;
-      
-      // Calculate share price (expectedLiquidity / totalSupply)
-      const currentSharePrice = current.totalSupply > 0n 
-        ? (current.expectedLiquidity * 1000000n) / current.totalSupply // Scale by 1e6 for precision
-        : 0n;
-      
-      const nextSharePrice = next.totalSupply > 0n 
-        ? (next.expectedLiquidity * 1000000n) / next.totalSupply
-        : 0n;
-      
-      // Revenue = TotalShares * (SharePrice(i+1) - SharePrice(i))
-      const sharePriceDiff = nextSharePrice - currentSharePrice;
-      const intervalRevenue = (current.totalSupply * sharePriceDiff) / 1000000n;
-      
-      // TVL = TotalShares * SharePrice
-      const intervalTVL = (current.totalSupply * currentSharePrice) / 1000000n;
-      
+      const sharePriceDiff = next.sharePrice - current.sharePrice;
+      const intervalRevenue = (current.totalSupply * sharePriceDiff) / SCALE;
+      if (sharePriceDiff < 0n) {
+        negativeSharePriceIntervals += 1;
+        negativeSharePriceDiff += sharePriceDiff;
+      }
       totalRevenue += intervalRevenue;
+      if (debugSharePrice && sharePriceDiff !== 0n) {
+        console.log(
+          `   [SharePrice] blocks ${current.blockNumber}->${next.blockNumber}: prev=${current.sharePrice.toString()} new=${next.sharePrice.toString()} ` +
+          `diff=${sharePriceDiff.toString()} revenueImpact=${intervalRevenue.toString()} totalRevenue=${totalRevenue.toString()}`
+        );
+      }
+      const intervalTVL = current.expectedLiquidity;
       weightedTVLSum += intervalTVL * BigInt(timeDelta);
       totalTimeSum += timeDelta;
+    }
+    
+    if (negativeSharePriceIntervals > 0) {
+      console.warn(`ℹ️ Share price declined in ${negativeSharePriceIntervals} intervals (cumulative diff ${negativeSharePriceDiff.toString()} scaled units). Declines are applied to revenue totals.`);
+    }
+
+    const transferEventsForRange = (transferEventsAll ?? []).filter(event => {
+      const blockNumber = Number(event.blockNumber);
+      return blockNumber >= actualFromBlock && blockNumber <= actualToBlock;
+    });
+    const lpTokenAddress = sanitized.poolAddress;
+
+    // ========================================================================
+    // REALIZED REVENUE (DAO MINTS)
+    // ========================================================================
+
+    console.log('🏁 Calculating realized revenue from treasury mints...');
+    let realizedSharesMinted = 0n;
+    let realizedRevenueRaw = 0n;
+    if (treasuryAddress) {
+      for (const event of transferEventsForRange) {
+        const from = event.args?.from?.toLowerCase?.() ?? '';
+        const to = event.args?.to?.toLowerCase?.() ?? '';
+        if (from === '0x0000000000000000000000000000000000000000' && to === treasuryAddress) {
+          const value = BigInt(event.args?.value ?? 0n);
+          realizedSharesMinted += value;
+        }
+      }
+      const daoSplitBps = BigInt(finalDaoSplit);
+      const realizedDaoShares = (realizedSharesMinted * daoSplitBps) / 10000n;
+      const finalSharePrice = anchorSnapshots[anchorSnapshots.length - 1].sharePrice;
+      realizedRevenueRaw = (realizedDaoShares * finalSharePrice) / SHARE_PRICE_SCALE;
+      console.log(`   Realized shares minted to treasury: ${realizedSharesMinted.toString()} -> DAO share ${realizedDaoShares.toString()}`);
+    } else {
+      console.warn('⚠️ Treasury address unavailable. Skipping realized revenue calculation.');
     }
     
     // ========================================================================
@@ -263,21 +345,14 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
       console.log(`   Selected addresses: ${revenueShareAddresses.length}`);
       console.log(`   Revenue share coefficient: ${revenueShareCoeff}`);
       
-      // The pool address IS the LP token address
-      const lpTokenAddress = sanitized.poolAddress;
-      
-      // Search for events in expanded range for interpolation
-      const searchFromBlock = Math.max(0, fromBlock - Math.floor(searchRange / 12));
-      const searchToBlock = toBlock + Math.floor(searchRange / 12);
-      
-      console.log(`🔍 Fetching LP token Transfer events from block ${searchFromBlock} to ${searchToBlock}...`);
-      const transferEvents = await getTransferEvents(lpTokenAddress, searchFromBlock, searchToBlock, client);
+      console.log('   Using cached transfer events for revenue share calculations...');
+      const transferEvents = transferEventsForRange;
       
       // Get unique block numbers where transfers occurred in the period
       const transferBlocks = [...new Set(transferEvents
         .filter(e => {
           const eventBlock = Number(e.blockNumber);
-          return eventBlock >= fromBlock && eventBlock <= toBlock;
+          return eventBlock >= actualFromBlock && eventBlock <= actualToBlock;
         })
         .map(e => Number(e.blockNumber))
       )].sort((a, b) => a - b);
@@ -297,12 +372,12 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
       console.log(`   Found ${relevantBlocks.length} blocks with transfers involving selected addresses`);
       
       // Add start and end blocks
-      const allBalanceCheckBlocks = [fromBlock, ...relevantBlocks, toBlock].filter((block, idx, arr) => arr.indexOf(block) === idx).sort((a, b) => a - b);
+      const allBalanceCheckBlocks = [actualFromBlock, ...relevantBlocks, actualToBlock].filter((block, idx, arr) => arr.indexOf(block) === idx).sort((a, b) => a - b);
       
       console.log(`   Checking balances at ${allBalanceCheckBlocks.length} key blocks...`);
       
       // Get balances at each key block
-      const balanceCheckPromises = allBalanceCheckBlocks.map(blockNumber => 
+      const balanceCheckPromises = allBalanceCheckBlocks.map(blockNumber =>
         getBlockTimestamp(blockNumber, client, blockCache, CACHE_TTL).then(timestamp => ({
           blockNumber,
           timestamp
@@ -311,39 +386,31 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
       
       const balanceCheckTimes = await Promise.all(balanceCheckPromises);
       
-      // Process in batches to avoid RPC overload
-      const BATCH_SIZE = 20;
+      const balanceSnapshots = await getAddressBalancesAtBlocksFromEvents(
+        lpTokenAddress,
+        actualFromBlock,
+        allBalanceCheckBlocks,
+        revenueShareAddresses,
+        client,
+        { transferEvents: transferEventsForRange }
+      );
+      
       let addressesTotalBalance = 0n;
       
-      for (let i = 0; i < balanceCheckTimes.length - 1; i += BATCH_SIZE) {
-        const batch = balanceCheckTimes.slice(i, Math.min(i + BATCH_SIZE, balanceCheckTimes.length));
+      for (let i = 0; i < balanceCheckTimes.length - 1; i++) {
+        const current = balanceCheckTimes[i];
+        const next = balanceCheckTimes[i + 1];
+        const balances = balanceSnapshots.get(current.blockNumber) ?? new Map();
         
-        const batchPromises = batch.map(async ({ blockNumber, timestamp }) => {
-          const balances = await getLPBalancesAtBlock(lpTokenAddress, revenueShareAddresses, blockNumber, client);
-          
-          // Sum all balances
-          let totalBalance = 0n;
-          for (const balance of balances.values()) {
-            totalBalance += balance;
-          }
-          
-          return { blockNumber, timestamp, totalBalance };
-        });
-        
-        const batchResults = await Promise.all(batchPromises);
-        
-        // Calculate weighted sum for this batch
-        for (let j = 0; j < batchResults.length - 1; j++) {
-          const current = batchResults[j];
-          const next = batchResults[j + 1];
-          
-          const timeDelta = next.timestamp - current.timestamp;
-          if (timeDelta > 0) {
-            addressesTotalBalance += current.totalBalance * BigInt(timeDelta);
-          }
+        let totalBalance = 0n;
+        for (const balance of balances.values()) {
+          totalBalance += balance;
         }
         
-        console.log(`   Processed ${Math.min(i + BATCH_SIZE, balanceCheckTimes.length)}/${balanceCheckTimes.length} balance checks`);
+        const timeDelta = next.timestamp - current.timestamp;
+        if (timeDelta > 0) {
+          addressesTotalBalance += totalBalance * BigInt(timeDelta);
+        }
       }
       
       addressesWeightedTVL = totalTimeSum > 0 ? addressesTotalBalance / BigInt(totalTimeSum) : 0n;
@@ -356,6 +423,11 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     // ========================================================================
     
     // Calculate averages and apply fees
+    const requestedPeriodSeconds = Math.max(finalTimestamp - initialTimestamp, 0);
+    const effectiveCoverageSeconds = totalTimeSum;
+    const coverageRatio = requestedPeriodSeconds > 0
+      ? Math.min(effectiveCoverageSeconds / requestedPeriodSeconds, 1)
+      : 0;
     const avgTVL = totalTimeSum > 0 ? weightedTVLSum / BigInt(totalTimeSum) : 0n;
     
     // Apply interest fee to total revenue first
@@ -365,6 +437,8 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     // Then apply DAO split to the interest fee revenue
     const daoSplitRate = finalDaoSplit / 10000; // Assuming basis points
     const finalRevenueForDAO = (revenueWithInterestFee * BigInt(Math.floor(daoSplitRate * 10000))) / 10000n;
+    const realizedRevenueForDAO = realizedRevenueRaw;
+    const totalRevenueForDAO = finalRevenueForDAO + realizedRevenueForDAO;
     
     // Get token decimals for proper formatting
     console.log('🔢 Getting token decimals...');
@@ -390,6 +464,7 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
     // RESULT PREPARATION
     // ========================================================================
     
+    const deployDateUsed = effectiveDeployDate ?? `~${(automaticLookbackDays ?? DEFAULT_LOOKBACK_DAYS)}d lookback`;
     const result = {
       pool: sanitized.poolAddress,
       fromDate: sanitized.fromDate,
@@ -397,9 +472,26 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
       avgTVL: (Number(avgTVL) / Math.pow(10, tokenDecimals)).toFixed(6),
       generatedRevenue: (Number(finalRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6),
       // Additional debug info
-      totalEvents: events.length,
+      totalEvents: eventsInRange.length,
       totalRevenueRaw: totalRevenue.toString(),
+      realizedRevenueRaw: realizedRevenueForDAO.toString(),
+      totalRevenueWithRealizedRaw: totalRevenueForDAO.toString(),
       avgTVLRaw: avgTVL.toString(),
+      requestedPeriodSeconds,
+      dataCoverageSeconds: totalTimeSum,
+      fallbackCoverageSeconds: fallbackTimeSum,
+      coverageRatio,
+      fallbackIntervals,
+      negativeSharePriceIntervals,
+      actualFromBlock,
+      actualToBlock,
+      actualFromTimestamp,
+      actualToTimestamp,
+      deployDate: deployDateUsed,
+      deployBlock,
+      realizedRevenueDao: realizedRevenueForDAO.toString(),
+      unrealizedRevenueDao: finalRevenueForDAO.toString(),
+      totalRevenueDao: totalRevenueForDAO.toString(),
       interestFee: sanitized.interestFee,
       daoSplit: finalDaoSplit,
       underlyingToken,
@@ -414,6 +506,9 @@ export async function calculateGearboxRevenue(rpcUrl, poolAddress, fromDate, toD
       result.revenueShareAddresses = revenueShareAddresses;
       result.revenueShareCoeff = revenueShareCoeff;
     }
+    result.realizedRevenue = (Number(realizedRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
+    result.unrealizedRevenue = (Number(finalRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
+    result.totalRevenue = (Number(totalRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
     
     return result;
     
