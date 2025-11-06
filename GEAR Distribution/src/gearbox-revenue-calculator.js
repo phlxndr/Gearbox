@@ -10,7 +10,7 @@ import { createPublicClient, http } from 'viem';
 import { mainnet } from 'viem/chains';
 import { validateInputParameters, sanitizeInputParameters, formatErrorMessage } from './utils/validation.js';
 import { dateToStartBlock, dateToEndBlock, getBlockTimestamp } from './utils/block-utils.js';
-import { getPoolEvents, derivePoolSnapshotsFromEvents, getPoolParameters, getUnderlyingToken, getAddressBalancesAtBlocksFromEvents, getTreasuryAddress, SHARE_PRICE_SCALE } from './utils/pool-utils.js';
+import { getPoolEvents, derivePoolSnapshotsFromEvents, getUnderlyingToken, getAddressBalancesAtBlocksFromEvents, SHARE_PRICE_SCALE, getTreasuryAddress } from './utils/pool-utils.js';
 import { getTokenName, getTokenDecimals } from './utils/token-utils.js';
 import { getCaches } from './utils/cache-utils.js';
 
@@ -37,7 +37,38 @@ export async function calculateGearboxRevenue(
   options = {}
 ) {
   try {
-    const { debugSharePrice = false, treasuryAddressOverride = null, daoShareOverride = null } = options ?? {};
+    const { debugSharePrice = false, treasuryAddressOverride = null, daoShareOverride, eventConcurrency = 3, timestampConcurrency = 2 } = options ?? {};
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const fetchBlockTimestamps = async (blockNumbers, limit = timestampConcurrency, label = 'timestamps') => {
+      const timestamps = [];
+      const total = blockNumbers.length;
+      if (total === 0) return timestamps;
+      const startTime = Date.now();
+      for (let i = 0; i < blockNumbers.length; i += limit) {
+        const chunk = blockNumbers.slice(i, i + limit);
+        const chunkResults = [];
+        for (const blockNumber of chunk) {
+          chunkResults.push(await getBlockTimestamp(blockNumber, client, blockCache, CACHE_TTL));
+          await sleep(100);
+        }
+        timestamps.push(...chunkResults);
+        const processed = Math.min(total, i + chunk.length);
+        if (total >= 5) {
+          const elapsedSeconds = (Date.now() - startTime) / 1000;
+          const progress = ((processed / total) * 100).toFixed(1);
+          const rate = elapsedSeconds > 0 ? processed / elapsedSeconds : 0;
+          const remaining = total - processed;
+          const etaSeconds = rate > 0 ? remaining / rate : 0;
+          const etaMessage = etaSeconds > 0 ? ` ETA ~${etaSeconds.toFixed(1)}s` : '';
+          console.log(`   [${label}] ${processed}/${total} timestamps (${progress}%)${etaMessage}`);
+        }
+        if (processed < total) {
+          await sleep(200);
+        }
+      }
+      return timestamps;
+    };
     // ========================================================================
     // INITIALIZATION
     // ========================================================================
@@ -121,7 +152,7 @@ export async function calculateGearboxRevenue(
         deployBlock,
         toBlock,
         client,
-        { includeTransfers: true }
+        { includeTransfers: true, maxConcurrency: eventConcurrency }
       );
       allEvents = fetchedEvents;
       transferEventsAll = transferEvents;
@@ -219,9 +250,21 @@ export async function calculateGearboxRevenue(
       throw new Error('Not enough events to compute revenue within the requested period.');
     }
 
-    anchorTimestamps = await Promise.all(anchorSnapshots.map(snapshot =>
-      getBlockTimestamp(snapshot.blockNumber, client, blockCache, CACHE_TTL)
-    ));
+    const anchorBlockNumbers = anchorSnapshots.map(snapshot => snapshot.blockNumber);
+    const effectiveTimestampConcurrency = Math.max(1, timestampConcurrency);
+    const perRequestMsEstimate = 180; // includes RPC latency + throttling sleep heuristic
+    const perGapMsEstimate = 200; // inter-chunk sleep (matches implementation)
+    const chunkSize = Math.min(effectiveTimestampConcurrency, Math.max(anchorBlockNumbers.length, 1));
+    const chunkCount = anchorBlockNumbers.length > 0 ? Math.ceil(anchorBlockNumbers.length / chunkSize) : 0;
+    const estimatedMs = anchorBlockNumbers.length > 0
+      ? (anchorBlockNumbers.length * (perRequestMsEstimate / effectiveTimestampConcurrency)) + Math.max(0, chunkCount - 1) * perGapMsEstimate
+      : 0;
+    const estimatedSeconds = (estimatedMs / 1000);
+    console.log(`⏳ Processing events across ${anchorBlockNumbers.length} anchor points (timestamp concurrency ${timestampConcurrency})...`);
+    if (anchorBlockNumbers.length > 0) {
+      console.log(`   Estimated processing time ≈ ${estimatedSeconds.toFixed(1)}s (heuristic; actual depends on RPC latency).`);
+    }
+    anchorTimestamps = await fetchBlockTimestamps(anchorBlockNumbers, timestampConcurrency, 'anchors');
 
     actualFromBlock = anchorSnapshots[0].blockNumber;
     actualToBlock = anchorSnapshots[anchorSnapshots.length - 1].blockNumber;
@@ -243,20 +286,34 @@ export async function calculateGearboxRevenue(
     // POOL CONFIGURATION
     // ========================================================================
     
-    console.log('⚙️ Fetching pool parameters...');
-    let finalDaoSplit = await getPoolParameters(sanitized.poolAddress, client);
-    if (daoShareOverride !== null) {
-      console.log(`   Overriding DAO share from ${finalDaoSplit} bps to ${daoShareOverride} bps`);
-      finalDaoSplit = daoShareOverride;
+    if (typeof daoShareOverride !== 'number') {
+      throw new Error('DAO share (--dao-share-bps) is required');
     }
+    const finalDaoSplit = daoShareOverride;
     
     console.log('🪙 Getting underlying token...');
     const underlyingToken = await getUnderlyingToken(sanitized.poolAddress, client);
 
+    const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
     let treasuryAddress = treasuryAddressOverride ? treasuryAddressOverride.toLowerCase() : null;
-    if (!treasuryAddress) {
-      console.log('🏦 Fetching treasury address (latest)...');
-      treasuryAddress = (await getTreasuryAddress(sanitized.poolAddress, client))?.toLowerCase();
+    if (treasuryAddress) {
+      console.log(`   Using treasury override: ${treasuryAddress}`);
+    } else {
+      try {
+        const onChainTreasury = await getTreasuryAddress(sanitized.poolAddress, client);
+        const normalizedTreasury = typeof onChainTreasury === 'string' ? onChainTreasury.toLowerCase() : null;
+        if (normalizedTreasury && normalizedTreasury !== ZERO_ADDRESS) {
+          treasuryAddress = normalizedTreasury;
+          console.log(`   Treasury (from contract): ${treasuryAddress}`);
+        } else {
+          throw new Error('pool treasury() returned zero address');
+        }
+      } catch (error) {
+        throw new Error(`Unable to fetch treasury address from pool contract. Provide --treasury override. (${error.message ?? error})`);
+      }
+    }
+    if (!treasuryAddress || treasuryAddress === ZERO_ADDRESS) {
+      throw new Error('Treasury address unavailable. Provide --treasury override.');
     }
     
     // ========================================================================
@@ -314,19 +371,37 @@ export async function calculateGearboxRevenue(
     // ========================================================================
 
     console.log('🏁 Calculating realized revenue from treasury mints...');
+    const treasuryDepositTxs = new Set();
+    if (treasuryAddress) {
+      for (const event of allEvents) {
+        if (event.type === 'Deposit') {
+          const owner = event.args?.owner?.toLowerCase?.() ?? '';
+          const assets = BigInt(event.args?.assets ?? event.args?.amount ?? 0n);
+          if (owner === treasuryAddress && assets > 0n) {
+            const txHash = event.transactionHash?.toLowerCase?.();
+            if (txHash) treasuryDepositTxs.add(txHash);
+          }
+        }
+      }
+    }
+
     let realizedSharesMinted = 0n;
     let realizedRevenueRaw = 0n;
     if (treasuryAddress) {
       for (const event of transferEventsForRange) {
         const from = event.args?.from?.toLowerCase?.() ?? '';
         const to = event.args?.to?.toLowerCase?.() ?? '';
+        const txHash = event.transactionHash?.toLowerCase?.();
         if (from === '0x0000000000000000000000000000000000000000' && to === treasuryAddress) {
+          if (txHash && treasuryDepositTxs.has(txHash)) {
+            continue;
+          }
           const value = BigInt(event.args?.value ?? 0n);
           realizedSharesMinted += value;
         }
       }
       const daoSplitBps = BigInt(finalDaoSplit);
-      const realizedDaoShares = (realizedSharesMinted * daoSplitBps) / 10000n;
+      const realizedDaoShares = (realizedSharesMinted);
       const finalSharePrice = anchorSnapshots[anchorSnapshots.length - 1].sharePrice;
       realizedRevenueRaw = (realizedDaoShares * finalSharePrice) / SHARE_PRICE_SCALE;
       console.log(`   Realized shares minted to treasury: ${realizedSharesMinted.toString()} -> DAO share ${realizedDaoShares.toString()}`);
@@ -377,14 +452,8 @@ export async function calculateGearboxRevenue(
       console.log(`   Checking balances at ${allBalanceCheckBlocks.length} key blocks...`);
       
       // Get balances at each key block
-      const balanceCheckPromises = allBalanceCheckBlocks.map(blockNumber =>
-        getBlockTimestamp(blockNumber, client, blockCache, CACHE_TTL).then(timestamp => ({
-          blockNumber,
-          timestamp
-        }))
-      );
-      
-      const balanceCheckTimes = await Promise.all(balanceCheckPromises);
+      const balanceTimestamps = await fetchBlockTimestamps(allBalanceCheckBlocks, timestampConcurrency, 'balance checkpoints');
+      const balanceCheckTimes = allBalanceCheckBlocks.map((blockNumber, idx) => ({ blockNumber, timestamp: balanceTimestamps[idx] }));
       
       const balanceSnapshots = await getAddressBalancesAtBlocksFromEvents(
         lpTokenAddress,
@@ -436,23 +505,21 @@ export async function calculateGearboxRevenue(
     
     // Then apply DAO split to the interest fee revenue
     const daoSplitRate = finalDaoSplit / 10000; // Assuming basis points
-    const finalRevenueForDAO = (revenueWithInterestFee * BigInt(Math.floor(daoSplitRate * 10000))) / 10000n;
+    const totalRevenueForDAO = (revenueWithInterestFee * BigInt(Math.floor(daoSplitRate * 10000))) / 10000n;
     const realizedRevenueForDAO = realizedRevenueRaw;
-    const totalRevenueForDAO = finalRevenueForDAO + realizedRevenueForDAO;
-    
+    const unrealizedRevenueForDAO = totalRevenueForDAO > realizedRevenueForDAO ? totalRevenueForDAO - realizedRevenueForDAO : 0n;
+
     // Get token decimals for proper formatting
     console.log('🔢 Getting token decimals...');
     const tokenDecimals = await getTokenDecimals(underlyingToken, client);
-    
+
     // Calculate revenue share if enabled
     let revenueShare = null;
     if (revenueShareAddresses && revenueShareAddresses.length > 0 && revenueShareCoeff !== null) {
-      // Formula: (addresses_TW_TVL / pool_TW_TVL) * pool_revenue * rev_share_coeff
-      // Use totalRevenue (before fees), not finalRevenueForDAO
-      if (avgTVL > 0n && addressesWeightedTVL > 0n && totalRevenue > 0n) {
-        const addressesShareRatio = (addressesWeightedTVL * 1000000n) / avgTVL; // Scale by 1e6
-        const poolRevenueScaled = totalRevenue * BigInt(Math.floor(revenueShareCoeff * 10000));
-        revenueShare = (addressesShareRatio * poolRevenueScaled) / 10000000000n; // Scale back
+      if (totalRevenueForDAO > 0n) {
+        const scaledCoeff = BigInt(Math.floor(revenueShareCoeff * 10000));
+        const revenueShareRaw = (totalRevenueForDAO * scaledCoeff) / 10000n;
+        revenueShare = revenueShareRaw;
       }
       console.log(`✅ Revenue share calculated: ${revenueShare ? revenueShare.toString() : '0'}`);
     }
@@ -470,7 +537,6 @@ export async function calculateGearboxRevenue(
       fromDate: sanitized.fromDate,
       toDate: sanitized.toDate,
       avgTVL: (Number(avgTVL) / Math.pow(10, tokenDecimals)).toFixed(6),
-      generatedRevenue: (Number(finalRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6),
       // Additional debug info
       totalEvents: eventsInRange.length,
       totalRevenueRaw: totalRevenue.toString(),
@@ -490,11 +556,12 @@ export async function calculateGearboxRevenue(
       deployDate: deployDateUsed,
       deployBlock,
       realizedRevenueDao: realizedRevenueForDAO.toString(),
-      unrealizedRevenueDao: finalRevenueForDAO.toString(),
+      unrealizedRevenueDao: unrealizedRevenueForDAO.toString(),
       totalRevenueDao: totalRevenueForDAO.toString(),
       interestFee: sanitized.interestFee,
       daoSplit: finalDaoSplit,
       underlyingToken,
+      treasuryAddress,
       underlyingTokenName: await getTokenName(underlyingToken, client),
       tokenDecimals: tokenDecimals
     };
@@ -507,7 +574,7 @@ export async function calculateGearboxRevenue(
       result.revenueShareCoeff = revenueShareCoeff;
     }
     result.realizedRevenue = (Number(realizedRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
-    result.unrealizedRevenue = (Number(finalRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
+    result.unrealizedRevenue = (Number(unrealizedRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
     result.totalRevenue = (Number(totalRevenueForDAO) / Math.pow(10, tokenDecimals)).toFixed(6);
     
     return result;

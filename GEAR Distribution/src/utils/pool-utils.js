@@ -6,7 +6,7 @@
 // IMPORTS
 // ============================================================================
 
-import { parseAbiItem } from 'viem';
+import { parseAbiItem, keccak256, stringToBytes } from 'viem';
 import { POOL_ABI, ERC20_TRANSFER_EVENT_ABI } from '../config.js';
 import { withRetry, sleep, isBlockRangeLimitError } from './rpc-utils.js';
 
@@ -30,95 +30,128 @@ export const SHARE_PRICE_SCALE = 1000000000000n; // scale share price by 1e12 fo
  * @returns {Promise<Array>} Array of events sorted by block number
  */
 export async function getPoolEvents(poolAddress, fromBlock, toBlock, client, options = {}) {
-  const { progressCallback = null, includeTransfers = false } = options;
+  const { progressCallback = null, includeTransfers = false, maxConcurrency = 4 } = options;
   const totalBlocks = Math.max(1, toBlock - fromBlock + 1);
-  let batchSize = DEFAULT_MAX_BLOCK_RANGE;
-  let currentFromBlock = fromBlock;
-  let batchIndex = 0;
-  let processedBlocks = 0;
-  let approximateTotalBatches = Math.max(1, Math.ceil(totalBlocks / batchSize));
+  const ranges = [];
+  for (let startBlock = fromBlock; startBlock <= toBlock; startBlock += DEFAULT_MAX_BLOCK_RANGE) {
+    const endBlock = Math.min(startBlock + DEFAULT_MAX_BLOCK_RANGE - 1, toBlock);
+    ranges.push({ start: startBlock, end: endBlock });
+  }
 
-  console.log(`🔄 Fetching events in batches (initial size up to ${batchSize} blocks)...`);
+  console.log(`🔄 Fetching events in ${ranges.length} batches (initial size up to ${DEFAULT_MAX_BLOCK_RANGE} blocks)...`);
 
-  const allEvents = [];
-  const transferEvents = includeTransfers ? [] : null;
   const depositEventAbi = parseAbiItem('event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)');
   const withdrawEventAbi = parseAbiItem('event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)');
   const transferEventAbi = includeTransfers ? parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)') : null;
 
-  while (currentFromBlock <= toBlock) {
-    const batchToBlock = Math.min(currentFromBlock + batchSize - 1, toBlock);
-    try {
-      const eventsToFetch = includeTransfers && transferEventAbi
-        ? [depositEventAbi, withdrawEventAbi, transferEventAbi]
-        : [depositEventAbi, withdrawEventAbi];
+  const depositTopic = keccak256(stringToBytes('Deposit(address,address,uint256,uint256)'));
+  const withdrawTopic = keccak256(stringToBytes('Withdraw(address,address,address,uint256,uint256)'));
+  const transferTopic = includeTransfers ? keccak256(stringToBytes('Transfer(address,address,uint256)')) : null;
 
-      const batchLogs = await withRetry(() => client.getLogs({
-        address: poolAddress,
-        events: eventsToFetch,
-        fromBlock: BigInt(currentFromBlock),
-        toBlock: BigInt(batchToBlock)
-      }), RETRY_OPTIONS);
+  const topicMap = new Map([
+    [depositTopic, 'Deposit'],
+    [withdrawTopic, 'Withdraw']
+  ]);
+  if (includeTransfers && transferTopic) {
+    topicMap.set(transferTopic, 'Transfer');
+  }
 
-      let depositCount = 0;
-      let withdrawCount = 0;
-      let transferCount = 0;
+  const eventBuckets = Array.from({ length: ranges.length }, () => []);
+  const transferBuckets = includeTransfers ? Array.from({ length: ranges.length }, () => []) : null;
 
-      for (const log of batchLogs) {
-        const eventName = log.eventName || '';
-        if (eventName === 'Deposit') {
-          depositCount += 1;
-          allEvents.push({ ...log, type: 'Deposit' });
-        } else if (eventName === 'Withdraw') {
-          withdrawCount += 1;
-          allEvents.push({ ...log, type: 'Withdraw' });
-        } else if (includeTransfers && transferEvents && eventName === 'Transfer') {
-          transferCount += 1;
-          transferEvents.push(log);
-        }
+  let processedBlocks = 0;
+  let completedBatches = 0;
+  let totalEventsCount = 0;
+
+  const processRange = async (range, index) => {
+    const eventsToFetch = includeTransfers && transferEventAbi
+      ? [depositEventAbi, withdrawEventAbi, transferEventAbi]
+      : [depositEventAbi, withdrawEventAbi];
+
+    const logs = await withRetry(() => client.getLogs({
+      address: poolAddress,
+      events: eventsToFetch,
+      fromBlock: BigInt(range.start),
+      toBlock: BigInt(range.end)
+    }), RETRY_OPTIONS);
+
+    let depositCount = 0;
+    let withdrawCount = 0;
+    let transferCount = 0;
+    let batchEventCount = 0;
+
+    for (const log of logs) {
+      const type = topicMap.get(log.topics?.[0]);
+      if (type === 'Deposit') {
+        depositCount += 1;
+        batchEventCount += 1;
+        eventBuckets[index].push({ ...log, type: 'Deposit' });
+      } else if (type === 'Withdraw') {
+        withdrawCount += 1;
+        batchEventCount += 1;
+        eventBuckets[index].push({ ...log, type: 'Withdraw' });
+      } else if (includeTransfers && transferBuckets && type === 'Transfer') {
+        transferCount += 1;
+        transferBuckets[index].push(log);
       }
-
-      batchIndex += 1;
-      processedBlocks += (batchToBlock - currentFromBlock + 1);
-      const transferMsg = includeTransfers ? `, Transfer logs: ${transferCount}` : '';
-      console.log(`   Batch ${batchIndex} (blocks ${currentFromBlock}-${batchToBlock}) completed. Deposit logs: ${depositCount}, Withdraw logs: ${withdrawCount}${transferMsg}, Total so far: ${allEvents.length}.`);
-
-      if (progressCallback) {
-        progressCallback({
-          stage: 'fetching_events',
-          progress: Math.min(processedBlocks / totalBlocks, 1),
-          current: batchIndex,
-          total: approximateTotalBatches,
-          eventsFound: allEvents.length,
-          metrics: { totalRequests: batchIndex, requestsPerSecond: 'N/A', errorRate: 0 }
-        });
-      }
-
-      currentFromBlock = batchToBlock + 1;
-      approximateTotalBatches = Math.max(batchIndex, batchIndex + Math.ceil(Math.max(0, toBlock - currentFromBlock + 1) / Math.max(batchSize, 1)));
-      if (currentFromBlock <= toBlock) {
-        await sleep(BATCH_DELAY_MS);
-      }
-    } catch (error) {
-      if (isBlockRangeLimitError(error) && batchSize > MIN_BLOCK_RANGE) {
-        batchSize = Math.max(MIN_BLOCK_RANGE, Math.floor(batchSize / 2));
-        approximateTotalBatches = Math.max(batchIndex + 1, batchIndex + Math.ceil(Math.max(0, toBlock - currentFromBlock + 1) / Math.max(batchSize, 1)));
-        console.warn(`⚠️ RPC limited block range, reducing batch size to ${batchSize} blocks...`);
-        continue;
-      }
-      console.error(`Error fetching batch ${batchIndex + 1}:`, error.message);
-      throw error;
     }
-  }
-  
-  const sortedEvents = allEvents.sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
-  console.log(`✅ Found ${sortedEvents.length} total events across ${batchIndex} batches`);
-  if (includeTransfers && transferEvents) {
-    transferEvents.sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
-    return { events: sortedEvents, transferEvents };
+
+    completedBatches += 1;
+    processedBlocks += (range.end - range.start + 1);
+    totalEventsCount += batchEventCount;
+    const transferMsg = includeTransfers ? `, Transfer logs: ${transferCount}` : '';
+    console.log(`   Batch ${completedBatches} (blocks ${range.start}-${range.end}) completed. Deposit logs: ${depositCount}, Withdraw logs: ${withdrawCount}${transferMsg}.`);
+
+    if (progressCallback) {
+      progressCallback({
+        stage: 'fetching_events',
+        progress: Math.min(processedBlocks / totalBlocks, 1),
+        current: completedBatches,
+        total: ranges.length,
+        eventsFound: totalEventsCount,
+        metrics: { totalRequests: completedBatches, requestsPerSecond: 'N/A', errorRate: 0 }
+      });
+    }
+  };
+
+  let nextIndex = 0;
+  const concurrency = Math.min(maxConcurrency, ranges.length);
+  let fallbackToSequential = false;
+
+  const worker = async () => {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= ranges.length) break;
+      const range = ranges[current];
+      try {
+        await processRange(range, current);
+      } catch (error) {
+        if (isBlockRangeLimitError(error) && !fallbackToSequential) {
+          console.warn(`⚠️ RPC limited block range while fetching ${range.start}-${range.end}. Falling back to sequential mode for remaining ranges.`);
+          fallbackToSequential = true;
+          for (let i = current; i < ranges.length; i++) {
+            await processRange(ranges[i], i);
+          }
+          nextIndex = ranges.length;
+          break;
+        }
+        throw error;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  const allEvents = eventBuckets.flat().sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
+  console.log(`✅ Found ${allEvents.length} total events across ${ranges.length} batches`);
+
+  if (includeTransfers && transferBuckets) {
+    const allTransfers = transferBuckets.flat().sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber));
+    return { events: allEvents, transferEvents: allTransfers };
   }
 
-  return { events: sortedEvents };
+  return { events: allEvents };
 }
 
 // ============================================================================
@@ -192,17 +225,7 @@ export function derivePoolSnapshotsFromEvents(events) {
  * @returns {Promise<number>} DAO split in basis points
  */
 export async function getPoolParameters(poolAddress, client) {
-  try {
-    const contractDaoSplit = await withRetry(() => client.readContract({
-      address: poolAddress,
-      abi: POOL_ABI,
-      functionName: 'daoSplit'
-    }), RETRY_OPTIONS);
-    return Number(contractDaoSplit);
-  } catch (error) {
-    console.warn('Could not fetch daoSplit from contract, using default 20%');
-    return 2000; // Default 20%
-  }
+  throw new Error('Fetching daoSplit from the contract is disabled. Provide --dao-share-bps via CLI.');
 }
 
 /**

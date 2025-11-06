@@ -21,7 +21,7 @@ async function main() {
   const args = process.argv.slice(2);
   
   if (args.length < 5) {
-    console.log('Usage: node index.js <rpcUrl> <poolAddress> <fromDate> <toDate> <interestFee> [--revenue-share] [--addresses] [--rev-coeff]');
+    console.log('Usage: node index.js <rpcUrl> <poolAddress> <fromDate> <toDate> <interestFee> --dao-share-bps <bps> [--treasury 0x...] [--revenue-share ...]');
     console.log('');
     console.log('Parameters:');
     console.log('  rpcUrl           - Ethereum RPC endpoint URL');
@@ -30,10 +30,12 @@ async function main() {
     console.log('  toDate           - End date in YYYY-MM-DD format');
     console.log('  interestFee      - Interest fee in basis points (0-10000)');
     console.log('');
+    console.log('Required flag:');
+    console.log('  --dao-share-bps  - DAO fee share in basis points (0-10000)');
+    console.log('');
     console.log('Optional (general):');
     console.log('  --deploy-date    - Deployment date in YYYY-MM-DD; limits event backfill');
     console.log('  --treasury       - Override treasury address (0x...)');
-    console.log('  --dao-share-bps  - Override DAO fee share in basis points (0-10000)');
     console.log('  --debug-share-price - Log share price deltas for each event interval');
     console.log('');
     console.log('Optional (for revenue share):');
@@ -102,6 +104,10 @@ async function main() {
     }
     daoShareOverride = parsedDaoShare;
   }
+  if (daoShareOverride === null) {
+    console.error('❌ --dao-share-bps flag is required (DAO share in basis points)');
+    process.exit(1);
+  }
   
   // Validate inputs
   const validation = validateInputParameters(poolAddress, fromDate, toDate, parsedInterestFee, deployDate);
@@ -125,6 +131,11 @@ async function main() {
   }
   if (daoShareOverride !== null) {
     console.log(`   DAO Share Override: ${daoShareOverride} bps`);
+  }
+  if (explicitTreasury) {
+    console.log(`   Treasury Override: ${explicitTreasury}`);
+  } else {
+    console.log('   Treasury: will query pool contract');
   }
   console.log('');
   
@@ -155,50 +166,49 @@ async function main() {
     console.log(`Pool: ${result.pool}`);
     console.log(`Date Range: ${result.fromDate} to ${result.toDate}`);
     console.log(`Average TVL: ${result.avgTVL} ${result.underlyingTokenName}`);
-    console.log(`Generated Revenue for DAO: ${result.generatedRevenue} ${result.underlyingTokenName}`);
+    console.log(`Total Revenue (DAO): ${result.totalRevenue} ${result.underlyingTokenName}`);
     console.log('');
     
-    // Underlying token info
-    console.log(`   Underlying Token: ${result.underlyingToken} (${result.underlyingTokenName})`);
-    console.log(`   Token Decimals: ${result.tokenDecimals}`);
-    console.log('');
-    
-    // Revenue share results
-    if (result.revenueShare !== undefined) {
-      console.log('💰 REVENUE SHARE RESULTS');
-      console.log('========================');
-      console.log(`Addresses Weighted TVL: ${result.addressesWeightedTVL} ${result.underlyingTokenName}`);
-      console.log(`Revenue Share: ${result.revenueShare} ${result.underlyingTokenName}`);
-      console.log(`Revenue Share Coefficient: ${result.revenueShareCoeff}`);
-      console.log(`Number of Addresses: ${result.revenueShareAddresses.length}`);
+    if (result.realizedRevenue !== undefined || result.unrealizedRevenue !== undefined) {
+      console.log('📦 Revenue Breakdown');
+      console.log('--------------------');
+      if (result.realizedRevenue !== undefined) {
+        console.log(`Realized Revenue (DAO): ${result.realizedRevenue} ${result.underlyingTokenName}`);
+      }
+      if (result.unrealizedRevenue !== undefined) {
+        console.log(`Unrealized Revenue (DAO): ${result.unrealizedRevenue} ${result.underlyingTokenName}`);
+      }
       console.log('');
     }
     
-    // Raw values for debugging
-    console.log('🔍 Raw Values (for debugging):');
+    if (result.revenueShare !== undefined) {
+      console.log('💰 REVENUE SHARE RESULTS');
+      console.log('========================');
+      console.log(`Referred Addresses Weighted TVL: ${result.addressesWeightedTVL} ${result.underlyingTokenName}`);
+      console.log(`Revenue Share: ${result.revenueShare} ${result.underlyingTokenName}`);
+      console.log(`Revenue Share Coefficient: ${result.revenueShareCoeff}`);
+      console.log(`Addresses Count: ${result.revenueShareAddresses.length}`);
+      console.log('');
+    }
+    
+    // Debug details
+    console.log('🔍 Debug Info:');
     console.log(`   Total Revenue Raw: ${result.totalRevenueRaw}`);
-    if (result.unrealizedRevenue !== undefined) {
-      console.log(`   Unrealized Revenue (DAO): ${result.unrealizedRevenue}`);
-    }
-    if (result.realizedRevenue !== undefined) {
-      console.log(`   Realized Revenue (DAO): ${result.realizedRevenue}`);
-    }
-    if (result.totalRevenue !== undefined) {
-      console.log(`   Total Revenue (DAO): ${result.totalRevenue}`);
-    }
+    console.log(`   Realized Revenue Raw: ${result.realizedRevenueRaw}`);
+    console.log(`   Total Revenue (DAO) Raw: ${result.totalRevenueWithRealizedRaw}`);
     console.log(`   Average TVL Raw: ${result.avgTVLRaw}`);
+    if (result.treasuryAddress) {
+      console.log(`   Treasury Address Used: ${result.treasuryAddress}`);
+    }
     if (typeof result.coverageRatio === 'number') {
-      console.log(`   Data Coverage: ${(result.coverageRatio * 100).toFixed(2)}% of requested period`);
+      console.log(`   Data Coverage: ${(result.coverageRatio * 100).toFixed(2)}%`);
       console.log(`   Time Using Fallback Data: ${result.fallbackCoverageSeconds ?? 0} seconds`);
       console.log(`   Fallback Intervals: ${result.fallbackIntervals ?? 0}`);
       console.log(`   Negative Share Price Intervals: ${result.negativeSharePriceIntervals}`);
-      if (result.actualFromBlock !== undefined && result.actualToBlock !== undefined) {
-        console.log(`   Anchored Blocks: ${result.actualFromBlock} -> ${result.actualToBlock}`);
-      }
-      if (result.deployBlock !== undefined) {
-        console.log(`   Deploy Date Used: ${result.deployDate}`);
-        console.log(`   Deploy Block Used: ${result.deployBlock}`);
-      }
+      console.log(`   Anchored Blocks: ${result.actualFromBlock} -> ${result.actualToBlock}`);
+      console.log(`   Anchored Period: ${new Date(result.actualFromTimestamp * 1000).toISOString()} -> ${new Date(result.actualToTimestamp * 1000).toISOString()}`);
+      console.log(`   Deploy Date Used: ${result.deployDate}`);
+      console.log(`   Deploy Block Used: ${result.deployBlock}`);
     }
     
   } catch (error) {
